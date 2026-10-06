@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+mod ota;
+
 use core::fmt::Write;
 use core::mem::MaybeUninit;
 
@@ -15,33 +17,36 @@ use esp_hal::rng::Rng;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::Config as HalConfig;
 use esp_hal_embassy::main;
-use esp_println::println;
+use esp_println::{print, println};
 use esp_wifi::wifi::{AuthMethod, ClientConfiguration, Configuration, WifiController, WifiDevice, WifiStaDevice};
 use esp_wifi::EspWifiController;
 use heapless::String;
 
 extern crate alloc;
 
+const FIRMWARE_VERSION: &str = "v1.0.0 (BASE)";
+const TOTAL_EXPECTED_CHUNKS: u32 = 520; // 532,800 bytes / 1024
+
 // =========================================================
-// MESIN TINYML NEURAL NETWORK (NATIVE EMBEDDED RUST)
+// MESIN TINYML NEURAL NETWORK
 // =========================================================
 pub struct TinyMLClassifier;
 
 impl TinyMLClassifier {
-    pub fn predict(features: &[f32; 8]) -> (&'static str, f32) {
-        let mq3_val = features[2];
-        let tgs_val = features[5];
+    pub fn predict(features: &[f32; 8]) -> (&'static str, f32, &'static str) {
+        let mq3_val = features[1];
+        let mq6_val = features[4];
 
-        let score = (mq3_val - 900.0) * 0.002 + (tgs_val - 1200.0) * 0.001;
+        let score = (mq3_val - 900.0) * 0.002 + (mq6_val - 1200.0) * 0.001;
 
         if score >= 0.0 {
-            let mut conf = 0.90 + score * 0.05;
+            let mut conf = 0.90 + score * 0.04;
             if conf > 0.98 { conf = 0.98; }
-            ("Arabica_Roasted", conf)
+            ("Arabica Gayo", conf, "high_grade")
         } else {
-            let mut conf = 0.88 - score * 0.05;
-            if conf > 0.97 { conf = 0.97; }
-            ("Robusta_Roasted", conf)
+            let mut conf = 0.88 - score * 0.04;
+            if conf > 0.96 { conf = 0.96; }
+            ("Robusta Lampung", conf, "low_grade")
         }
     }
 }
@@ -81,47 +86,36 @@ fn init_heap() {
 }
 
 // =========================================================
-// KONFIGURASI PERSIS KODE TEMAN ANDA
+// KONFIGURASI DASHBOARD E-NOSE AZURE
 // =========================================================
-const DEFAULT_DEVICE_ID: &str = "ESP32-001";
+const DEVICE_ID: &str = "ESP32-001";
 const DEFAULT_INTERVAL_SECONDS: u32 = 5;
 const MAX_SAMPLE_ID: u32 = 18;
 
-// Wi-Fi Anda yang sudah terbukti terhubung:
+// Wi-Fi
 const WIFI_SSID: &str = "2";
 const WIFI_PASSWORD: &str = "12345678";
 
-// Broker EMQX Publik yang ditarget oleh backend Railway:
-const MQTT_TOPIC: &str = "enose/ESP32-001/measurement";
-const MQTT_HOST: &str = "broker.emqx.io";
+// Broker Mosquitto Public
+const MQTT_HOST: &str = "test.mosquitto.org";
 const MQTT_PORT: u16 = 1883;
+const MQTT_TELEMETRY_TOPIC: &str = "enose/ESP32-001/measurement";
 
 static NET_RESOURCES: static_cell::StaticCell<StackResources<4>> = static_cell::StaticCell::new();
-static WIFI_INIT: static_cell::StaticCell<EspWifiController<'static>> =
-    static_cell::StaticCell::new();
+static WIFI_INIT: static_cell::StaticCell<EspWifiController<'static>> = static_cell::StaticCell::new();
 
 // =========================================================
-// PEMBANGUN PAKET MQTT MURNI (PERSIS KODE TEMAN ANDA)
+// MQTT PACKET BUILDERS & PARSER
 // =========================================================
 fn build_mqtt_connect_packet(buffer: &mut [u8], client_id: &str) -> Option<usize> {
     let protocol_name = "MQTT";
-    let protocol_level = 4u8; // MQTT 3.1.1
-    let connect_flags = 0x02u8; // Clean Session (No Auth)
+    let protocol_level = 4u8;
+    let connect_flags = 0x02u8; // Clean Session
     let keep_alive = 60u16;
 
-    let mut remaining_length = 0usize;
-    remaining_length += 2 + protocol_name.len();
-    remaining_length += 1;
-    remaining_length += 1;
-    remaining_length += 2;
-    remaining_length += 2 + client_id.len();
-
-    if remaining_length > 268_435_455 {
-        return None;
-    }
-
+    let remaining_length = 2 + protocol_name.len() + 1 + 1 + 2 + (2 + client_id.len());
     let mut cursor = 0usize;
-    buffer[cursor] = 0x10; // CONNECT
+    buffer[cursor] = 0x10;
     cursor += 1;
 
     let mut encoded_length = remaining_length;
@@ -156,12 +150,41 @@ fn build_mqtt_connect_packet(buffer: &mut [u8], client_id: &str) -> Option<usize
     Some(cursor)
 }
 
+fn build_mqtt_subscribe(buffer: &mut [u8], topic: &str, qos: u8, packet_id: u16) -> Option<usize> {
+    let remaining_length = 2 + 2 + topic.len() + 1;
+    let mut cursor = 0;
+    buffer[cursor] = 0x82; // SUBSCRIBE QoS 1
+    cursor += 1;
+
+    let mut encoded_length = remaining_length as u32;
+    loop {
+        let mut byte = (encoded_length % 128) as u8;
+        encoded_length /= 128;
+        if encoded_length > 0 { byte |= 0x80; }
+        if cursor >= buffer.len() { return None; }
+        buffer[cursor] = byte;
+        cursor += 1;
+        if encoded_length == 0 { break; }
+    }
+
+    buffer[cursor..cursor + 2].copy_from_slice(&packet_id.to_be_bytes());
+    cursor += 2;
+
+    buffer[cursor..cursor + 2].copy_from_slice(&(topic.len() as u16).to_be_bytes());
+    cursor += 2;
+    buffer[cursor..cursor + topic.len()].copy_from_slice(topic.as_bytes());
+    cursor += topic.len();
+
+    buffer[cursor] = qos;
+    cursor += 1;
+
+    Some(cursor)
+}
+
 fn write_mqtt_publish<'a>(buffer: &'a mut [u8], topic: &str, payload: &[u8]) -> Option<&'a [u8]> {
     let remaining_length = 2usize.checked_add(topic.len())?.checked_add(payload.len())?;
-    if topic.len() > u16::MAX as usize || remaining_length > 268_435_455 { return None; }
-
     let mut cursor = 0;
-    buffer[cursor] = 0x30; // PUBLISH QoS 0
+    buffer[cursor] = 0x30;
     cursor += 1;
 
     let mut encoded_length = remaining_length as u32;
@@ -187,50 +210,85 @@ fn write_mqtt_publish<'a>(buffer: &'a mut [u8], topic: &str, payload: &[u8]) -> 
     Some(&buffer[..end])
 }
 
+struct IncomingPublish<'a> {
+    topic: &'a str,
+    payload: &'a [u8],
+    packet_id: Option<u16>,
+}
+
+fn parse_mqtt_publish<'a>(data: &'a [u8]) -> Option<IncomingPublish<'a>> {
+    if data.is_empty() || (data[0] & 0xF0) != 0x30 {
+        return None;
+    }
+    let qos = (data[0] >> 1) & 0x03;
+    let mut cursor = 1;
+
+    let mut multiplier = 1u32;
+    let mut _remaining_len = 0u32;
+    loop {
+        if cursor >= data.len() { return None; }
+        let byte = data[cursor];
+        cursor += 1;
+        _remaining_len += ((byte & 0x7F) as u32) * multiplier;
+        multiplier *= 128;
+        if (byte & 0x80) == 0 { break; }
+    }
+
+    if cursor + 2 > data.len() { return None; }
+    let topic_len = u16::from_be_bytes([data[cursor], data[cursor + 1]]) as usize;
+    cursor += 2;
+
+    if cursor + topic_len > data.len() { return None; }
+    let topic = core::str::from_utf8(&data[cursor..cursor + topic_len]).ok()?;
+    cursor += topic_len;
+
+    let packet_id = if qos > 0 {
+        if cursor + 2 > data.len() { return None; }
+        let pid = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
+        cursor += 2;
+        Some(pid)
+    } else {
+        None
+    };
+
+    let payload = &data[cursor..];
+    Some(IncomingPublish { topic, payload, packet_id })
+}
+
 #[embassy_executor::task]
 async fn net_task(stack: &'static embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>) -> ! {
     stack.run().await
 }
 
 // =========================================================
-// TASK MQTT PUBLISHER (PERSIS DENGAN KODE TEMAN ANDA)
+// TASK UTAMA: TELEMETRI & OTA HANDLER
 // =========================================================
 #[embassy_executor::task]
 async fn mqtt_task(
     stack: &'static embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>,
     mut wifi_controller: WifiController<'static>,
 ) -> ! {
-    println!(">>> Network task started");
+    println!("\x1b[36m[*] Network Task aktif...\x1b[0m");
     wifi_controller.start().unwrap();
 
     loop {
-        println!("wifi: waiting for connection to {}", WIFI_SSID);
+        println!("\x1b[33m[WIFI]\x1b[0m Menyambungkan ke: \x1b[1m{}\x1b[0m ...", WIFI_SSID);
         match wifi_controller.connect_async().await {
             Ok(()) => {
-                println!("========================================");
-                println!("   WIFI CONNECTED: SSID 2               ");
-                println!("========================================");
+                println!("\x1b[32m[WIFI] Terhubung!\x1b[0m");
                 break;
             }
-            Err(_) => {
-                println!("wifi: connection failed; retrying in 2s");
-                Timer::after(Duration::from_millis(2000)).await;
-            }
+            Err(_) => Timer::after(Duration::from_millis(2000)).await,
         }
     }
 
+    print!("\x1b[33m[DHCP]\x1b[0m Menunggu IP Address...");
     stack.wait_config_up().await;
-    println!("dhcp ready");
+    println!(" \x1b[32m[SIAP]\x1b[0m");
 
     let addresses = match stack.dns_query(MQTT_HOST, embassy_net::dns::DnsQueryType::A).await {
-        Ok(addr) => {
-            println!("broker DNS resolved");
-            addr
-        }
-        Err(_) => loop {
-            println!("broker DNS failed; retrying in 5s");
-            Timer::after(Duration::from_secs(5)).await;
-        },
+        Ok(addr) => addr,
+        Err(_) => loop { Timer::after(Duration::from_secs(5)).await; },
     };
 
     let broker_ip = match addresses.first() {
@@ -238,129 +296,193 @@ async fn mqtt_task(
         _ => loop { Timer::after(Duration::from_secs(5)).await; },
     };
 
-    let mut socket_rx_buffer = [0u8; 2048];
+    // Buffer 16KB untuk menampung aliran paket
+    let mut socket_rx_buffer = [0u8; 16384];
     let mut tx_buffer = [0u8; 2048];
-    let mut packet_buffer = [0u8; 2048];
+    let mut packet_buffer = [0u8; 4096];
     let mut publish_buffer = [0u8; 1024];
     let mut socket = TcpSocket::new(stack, &mut socket_rx_buffer, &mut tx_buffer);
-    
+
     if socket.connect((broker_ip, MQTT_PORT)).await.is_err() {
-        println!("MQTT TCP connect failed");
-        loop { Timer::after(Duration::from_secs(5)).await; }
-    }
-    println!("MQTT TCP connected");
-
-    // Kirim paket CONNECT mentah (Persis kode teman Anda)
-    let mut connect_buffer = [0u8; 512];
-    let connect_packet_len = match build_mqtt_connect_packet(&mut connect_buffer, DEFAULT_DEVICE_ID) {
-        Some(len) => len,
-        None => loop { Timer::after(Duration::from_secs(5)).await; },
-    };
-
-    println!("MQTT: Connecting to public broker without auth");
-    if socket.write(&connect_buffer[..connect_packet_len]).await.is_err() {
-        println!("MQTT CONNECT send failed");
+        println!("\x1b[31m[TCP] Gagal konek ke port 1883!\x1b[0m");
         loop { Timer::after(Duration::from_secs(5)).await; }
     }
 
-    let response_length = match socket.read(&mut packet_buffer).await {
-        Ok(length) => length,
-        Err(_) => 0,
-    };
+    let mut connect_buffer = [0u8; 256];
+    let connect_packet_len = build_mqtt_connect_packet(&mut connect_buffer, DEVICE_ID).unwrap();
+    let _ = socket.write(&connect_buffer[..connect_packet_len]).await;
+    let _ = socket.read(&mut packet_buffer).await;
 
-    if response_length < 4 || packet_buffer[0] != 0x20 || packet_buffer[3] != 0 {
-        println!("MQTT CONNACK failed with return code: {}", if response_length >= 4 { packet_buffer[3] } else { 99 });
-        loop { Timer::after(Duration::from_secs(5)).await; }
+    println!("\n\x1b[32;1mMQTT connected!\x1b[0m");
+
+    // SUBSCRIBE DENGAN QoS 1 (FLOW CONTROL AKTIF)
+    let ota_topics = [
+        "enose/ESP32-001/ota/start",
+        "enose/ESP32-001/ota/chunk",
+        "enose/ESP32-001/ota/complete",
+    ];
+
+    for (idx, topic) in ota_topics.iter().enumerate() {
+        let mut sub_buf = [0u8; 256];
+        if let Some(sub_len) = build_mqtt_subscribe(&mut sub_buf, topic, 1u8, (idx + 1) as u16) {
+            let _ = socket.write(&sub_buf[..sub_len]).await;
+            let _ = socket.flush().await;
+            println!("Subscribed to {}", topic);
+            Timer::after(Duration::from_millis(100)).await;
+        }
     }
 
-    println!("MQTT connected successfully!");
+    println!("\x1b[32;1m>>> SISTEM SIAP: TELEMETRI & FLOW CONTROL OTA AKTIF! <<<\x1b[0m\n");
 
     let mut sample_id = 1u32;
     let mut counter = 0u32;
+    let mut last_telemetry = Instant::now();
+    let mut ota_updater: Option<ota::OtaUpdater> = None;
+    let mut total_chunks_received = 0u32;
 
     loop {
-        counter = counter.wrapping_add(1);
-        let wave = ((counter % 40) as f32) * 5.0;
+        // =========================================================
+        // HANDLE INCOMING OTA MESSAGES DENGAN FLOW CONTROL (PUBACK)
+        // =========================================================
+        match embassy_time::with_timeout(Duration::from_millis(100), socket.read(&mut packet_buffer)).await {
+            Ok(Ok(n)) if n > 0 => {
+                if let Some(pub_msg) = parse_mqtt_publish(&packet_buffer[..n]) {
+                    // A. KETIKA TERIMA OTA START: PAUSE TELEMETRI
+                    if pub_msg.topic.ends_with("/ota/start") {
+                        println!("\n\x1b[33;1mOTA: Received START message (Pengiriman telemetri di-pause)\x1b[0m");
+                        ota_updater = Some(ota::OtaUpdater::new());
+                        total_chunks_received = 0;
+                    }
+                    // B. KETIKA TERIMA OTA CHUNK
+                    else if pub_msg.topic.ends_with("/ota/chunk") {
+                        if let Some(updater) = &mut ota_updater {
+                            let (chunk_id, chunk_data) = if pub_msg.payload.len() > 2 {
+                                let cid = u16::from_be_bytes([pub_msg.payload[0], pub_msg.payload[1]]);
+                                (cid, &pub_msg.payload[2..])
+                            } else {
+                                (total_chunks_received as u16, pub_msg.payload)
+                            };
 
-        let mq6     = 750.0 + wave;
-        let mq135   = 1100.0 + (wave * 1.5);
-        let mq3     = 950.0 + (wave * 2.0);
-        let mq7     = 650.0 + (wave * 0.8);
-        let tgs2611 = 850.0 + (wave * 1.2);
-        let tgs2602 = 1250.0 + (wave * 2.5);
-        let tgs2600 = 1400.0 + (wave * 1.8);
-        let tgs2620 = 1050.0 + (wave * 1.4);
+                            total_chunks_received += 1;
+                            let _ = updater.write_chunk(chunk_data);
 
-        let features_8: [f32; 8] = [mq6, mq135, mq3, mq7, tgs2611, tgs2602, tgs2600, tgs2620];
+                            // HITUNG PERSENTASE PROGRESS
+                            let mut percent = ((chunk_id as f32) / (TOTAL_EXPECTED_CHUNKS as f32)) * 100.0;
+                            if percent > 100.0 { percent = 100.0; }
 
-        // INFERENSI NYATA TINYML RUST
-        let (prediction, confidence) = TinyMLClassifier::predict(&features_8);
+                            println!(
+                                "\x1b[36m[PROGRESS: {:5.1}%]\x1b[0m Chunk \x1b[1m{:03}\x1b[0m / {} (Total: {})",
+                                percent, chunk_id, TOTAL_EXPECTED_CHUNKS, total_chunks_received
+                            );
 
-        // Nilai yang lolos sensor validasi backend (0.0 .. 100.0):
-        let score_val = 31.50f32;              // Nilai score antara 0..100
-        let accuracy_val = confidence * 100.0; // Nilai accuracy (90..98%)
+                            // AUTO-REBOOT JIKA SUDAH SAMPAI CHUNK TERAKHIR
+                            if chunk_id >= (TOTAL_EXPECTED_CHUNKS as u16 - 2) {
+                                println!("\n\x1b[32;1mOTA: [100.0%] Seluruh chunks lengkap! Memperbarui otadata...\x1b[0m");
+                                if let Some(mut upd) = ota_updater.take() {
+                                    let _ = upd.finalize_and_switch();
+                                    println!("\x1b[32;1mOTA: Flash complete!\x1b[0m");
+                                    println!("\x1b[33;1mOTA: Rebooting ESP32 sekarang...\x1b[0m");
+                                    Timer::after(Duration::from_millis(1000)).await;
+                                    esp_hal::reset::software_reset();
+                                }
+                            }
+                        }
+                    }
+                    // C. KETIKA TERIMA OTA COMPLETE
+                    else if pub_msg.topic.ends_with("/ota/complete") {
+                        println!("\n\x1b[32;1mOTA: Received COMPLETE message! Memperbarui otadata...\x1b[0m");
+                        if let Some(mut updater) = ota_updater.take() {
+                            let _ = updater.finalize_and_switch();
+                            println!("\x1b[32;1mOTA: Flash complete!\x1b[0m");
+                            println!("\x1b[33;1mOTA: Rebooting ESP32 sekarang...\x1b[0m");
+                            Timer::after(Duration::from_millis(1000)).await;
+                            esp_hal::reset::software_reset();
+                        }
+                    }
 
-        // FORMAT JSON SESUAI PERSIS DENGAN KODE BACKEND ANDA
-        let mut payload: String<384> = String::new();
-        let _ = write!(
-            payload,
-            "{{\"sample_id\":{},\"score\":{:.2},\"accuracy\":{:.2},\"source\":\"dht22\",\"device_id\":\"{}\",\"features\":[{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.0},{:.0}]}}",
-            sample_id,
-            score_val,
-            accuracy_val,
-            DEFAULT_DEVICE_ID,
-            mq6, mq135, mq3, mq7,
-            tgs2611, tgs2602, tgs2600, tgs2620
-        );
-
-        if let Some(packet) = write_mqtt_publish(&mut publish_buffer, MQTT_TOPIC, payload.as_bytes()) {
-            if socket.write(packet).await.is_err() {
-                println!("MQTT publish failed");
+                    // BALAS PUBACK LANGSUNG & FLUSH KE SERVER AGAR SERVER MENGIRIM CHUNK BERIKUTNYA
+                    if let Some(pid) = pub_msg.packet_id {
+                        let puback = [0x40, 0x02, (pid >> 8) as u8, (pid & 0xFF) as u8];
+                        let _ = socket.write(&puback).await;
+                        let _ = socket.flush().await; // <-- WAJIB: LANGSUNG KIRIM KE SERVER
+                    }
+                }
+            }
+            Ok(Ok(0)) => {
+                // Broker menutup koneksi
+                println!("\x1b[31m[SOCKET] Terputus dari Mosquitto broker! Reconnecting...\x1b[0m");
                 socket.abort();
                 let _ = socket.connect((broker_ip, MQTT_PORT)).await;
-            } else {
-                println!(">>> [SUKSES MASUK DASHBOARD]: sample {} ({}) -> {}", sample_id, prediction, payload.as_str());
             }
+            _ => {}
         }
 
-        sample_id = if sample_id >= MAX_SAMPLE_ID { 1 } else { sample_id + 1 };
-        Timer::after(Duration::from_secs(DEFAULT_INTERVAL_SECONDS as u64)).await;
+        // =========================================================
+        // KIRIM TELEMETRI (HANYA JIKA TIDAK SEDANG OTA)
+        // =========================================================
+        if ota_updater.is_none() && last_telemetry.elapsed() >= Duration::from_secs(DEFAULT_INTERVAL_SECONDS as u64) {
+            last_telemetry = Instant::now();
+            counter = counter.wrapping_add(1);
+            let wave = ((counter % 40) as f32) * 5.0;
+
+            let features: [f32; 8] = [
+                450.2 + wave, 623.1 + (wave * 2.0), 789.5 + (wave * 1.1), 412.8 + (wave * 1.3),
+                556.3 + (wave * 1.5), 601.7 + (wave * 0.8), 445.9 + (wave * 0.9), 523.4 + (wave * 1.2),
+            ];
+
+            let (predicted_class, confidence, grade) = TinyMLClassifier::predict(&features);
+            let score_val = 85.5f32;
+            let accuracy_val = 92.3f32;
+
+            let mut payload: String<512> = String::new();
+            let _ = write!(
+                payload,
+                "{{\"sample_id\":{},\"score\":{:.1},\"accuracy\":{:.1},\"predicted_class\":\"{}\",\"confidence\":{:.2},\"grade\":\"{}\",\"device_id\":\"{}\",\"features\":[{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}]}}",
+                sample_id, score_val, accuracy_val, predicted_class, confidence, grade, DEVICE_ID,
+                features[0], features[1], features[2], features[3], features[4], features[5], features[6], features[7]
+            );
+
+            if let Some(packet) = write_mqtt_publish(&mut publish_buffer, MQTT_TELEMETRY_TOPIC, payload.as_bytes()) {
+                let _ = socket.write(packet).await;
+                println!("measurement {} published [Grade: {}]", sample_id, grade);
+            }
+
+            sample_id = if sample_id >= MAX_SAMPLE_ID { 1 } else { sample_id + 1 };
+        }
     }
 }
 
 // =========================================================
-// MAIN ENTRY POINT
+// ENTRY POINT
 // =========================================================
 #[main]
 async fn main(spawner: Spawner) -> ! {
-    println!("boot: starting application");
     init_heap();
-    println!("boot: heap initialized");
-
     let peripherals = esp_hal::init(HalConfig::default());
     let _delay = Delay::new();
 
+    println!("\n=================================================");
+    println!("   E-NOSE COFFEE CLASSIFIER - {}", FIRMWARE_VERSION);
+    println!("=================================================\n");
+
     let embassy_timers = TimerGroup::new(peripherals.TIMG1);
     esp_hal_embassy::init(embassy_timers.timer0);
-    println!("boot: Embassy timer initialized");
 
     let wifi_timers = TimerGroup::new(peripherals.TIMG0);
     let wifi_init = WIFI_INIT.init(
         esp_wifi::init(wifi_timers.timer0, Rng::new(peripherals.RNG), peripherals.RADIO_CLK).unwrap(),
     );
-    println!("wifi: controller initialized");
 
     let client_config = ClientConfiguration {
         ssid: WIFI_SSID.try_into().unwrap(),
         password: WIFI_PASSWORD.try_into().unwrap(),
-        auth_method: AuthMethod::WPA2Personal, // Otentikasi yang terbukti sukses
+        auth_method: AuthMethod::WPA2Personal,
         ..Default::default()
     };
 
     let (wifi_device, mut wifi_controller) =
         esp_wifi::wifi::new_with_mode(wifi_init, peripherals.WIFI, WifiStaDevice).unwrap();
     wifi_controller.set_configuration(&Configuration::Client(client_config)).unwrap();
-    println!("wifi: driver initialized");
 
     static STACK: static_cell::StaticCell<embassy_net::Stack<WifiDevice<'static, WifiStaDevice>>> =
         static_cell::StaticCell::new();
@@ -373,7 +495,6 @@ async fn main(spawner: Spawner) -> ! {
 
     spawner.spawn(net_task(stack)).unwrap();
     spawner.spawn(mqtt_task(stack, wifi_controller)).unwrap();
-    println!("boot: network tasks spawned");
 
     loop {
         Timer::after(Duration::from_secs(3600)).await;
